@@ -1,4 +1,4 @@
-name: ecos-live-feed-publish-PUBLIC.yml.bak
+name: Snowball ECOS Daily Public Feed
 on:
   workflow_dispatch:
   schedule:
