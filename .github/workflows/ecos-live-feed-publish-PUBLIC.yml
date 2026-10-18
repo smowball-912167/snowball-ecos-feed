@@ -1,0 +1,131 @@
+name: Snowball ECOS Daily Public Feed
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '10 23 * * *'  # 08:10 Asia/Seoul; GitHub schedules may be delayed
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: snowball-ecos-feed-pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+    steps:
+      - name: Fetch five strictly checked ECOS series (key stays secret)
+        shell: bash
+        env:
+          ECOS_API_KEY: ${{ secrets.ECOS_API_KEY }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYECOS'
+          #!/usr/bin/env python3
+          """ECOS -> public, credential-free snapshot for Snowball. Run in Actions only.
+          No ECOS API credentials appear in the ZIP, output JSON, logs, or APK.
+          Strict exact source table/item/cycle/unit selection; ambiguous dates fail closed.
+          """
+          import os, sys, json, re, datetime as dt, urllib.request, urllib.parse, urllib.error, time
+          from pathlib import Path
+          ROOT=Path.cwd()
+          SPECS={'kr_base_d': {'name': '한국 기준금리', 'table': '722Y001', 'item': '0101000', 'cycle': 'D', 'unit': '연%'}, 'kr_treasury_3y_d': {'name': '한국 국고채 3년물', 'table': '817Y002', 'item': '010200000', 'cycle': 'D', 'unit': '연%'}, 'kr_cpi_m': {'name': '한국 소비자물가지수 총지수', 'table': '901Y009', 'item': '0', 'cycle': 'M', 'unit': '2020=100'}, 'ppi_m': {'name': '한국 생산자물가지수 총지수', 'table': '404Y014', 'item': '*AA', 'cycle': 'M', 'unit': '2020=100'}, 'exports_m': {'name': '한국 총수출금액 월별 후보', 'table': '901Y118', 'item': 'T002', 'cycle': 'M', 'unit': '천불'}}
+          SECRET=os.environ.get('ECOS_API_KEY','')
+          class DataError(Exception): pass
+          
+          def query(spec,now):
+              if not re.fullmatch(r'[a-zA-Z0-9_-]{8,128}',SECRET):raise DataError('GitHub ECOS_API_KEY secret missing or invalid')
+              cycle=spec['cycle']
+              start=((now-dt.timedelta(days=430)).strftime('%Y%m%d') if cycle=='D' else f'{now.year-4}01')
+              end=(now.strftime('%Y%m%d') if cycle=='D' else now.strftime('%Y%m'))
+              codes=[spec['table'],cycle,start,end,spec['item']]
+              encoded='/'.join(urllib.parse.quote(str(x),safe='') for x in ['StatisticSearch',SECRET,'json','kr','1','900']+codes)
+              url='https://ecos.bok.or.kr/api/'+encoded
+              # Never print URLs/exceptions: API key is in URL path.
+              try:
+                  req=urllib.request.Request(url,headers={'Accept':'application/json','User-Agent':'SNOWBALL-ECOS-live/1.0'})
+                  with urllib.request.urlopen(req,timeout=30) as resp:
+                      if resp.status!=200 or resp.geturl()!=url:raise DataError('HTTP response or redirect rejected')
+                      body=resp.read(3_000_001)
+                  if len(body)>3_000_000:raise DataError('Response exceeds limit')
+                  doc=json.loads(body)
+              except Exception as ex:
+                  raise DataError('ECOS request failed ('+type(ex).__name__+')') from None
+              block=doc.get('StatisticSearch') if isinstance(doc,dict) else None
+              if not isinstance(block,dict) or not isinstance(block.get('row'),list):raise DataError('ECOS response missing StatisticSearch.row')
+              result={};sig={}; rejected=0
+              for r in block['row']:
+                  if (not isinstance(r,dict) or str(r.get('STAT_CODE',''))!=spec['table'] or
+                      str(r.get('ITEM_CODE1',''))!=spec['item']):rejected+=1;continue
+                  t=str(r.get('TIME',''));raw=str(r.get('DATA_VALUE','')).replace(',','').strip()
+                  if not re.fullmatch(r'20\d{6}' if cycle=='D' else r'20\d{4}',t):rejected+=1;continue
+                  try:v=float(raw)
+                  except (ValueError,TypeError):rejected+=1;continue
+                  if not -1e16<v<1e16:rejected+=1;continue
+                  unit=re.sub(r'\s+','',str(r.get('UNIT_NAME','')))
+                  expected=re.sub(r'\s+','',spec['unit'])
+                  if unit!=expected:rejected+=1;continue
+                  dimension=tuple(str(r.get('ITEM_CODE'+str(k),'') or '') for k in (2,3,4))
+                  if t in result:
+                      # With multiple dimensional combinations never guess which value is correct.
+                      if dimension!=sig[t] or v!=result[t]:raise DataError('duplicate date / multi dimension: manual review')
+                      continue
+                  result[t]=v;sig[t]=dimension
+              if len(result)<(10 if cycle=='D' else 13):raise DataError('too few strictly validated values')
+              periods=sorted(result)
+              if len({sig[t] for t in periods})!=1:raise DataError('multiple dimensions through time')
+              last=periods[-1]
+              if cycle=='D':d=dt.datetime.strptime(last,'%Y%m%d').date();maxdays=160 if spec['table']=='722Y001' else 12
+              else:d=dt.datetime.strptime(last,'%Y%m').date();maxdays=150 if spec['item']=='US' else 105
+              if d>now+dt.timedelta(days=1) or (now-d).days>maxdays:raise DataError('latest observation stale')
+              return {'name':spec['name'],'table':spec['table'],'item':spec['item'],'cycle':cycle,'unit':spec['unit'],
+                      'latest':last,'value':result[last],'history':[[t,result[t]] for t in periods[-440:]],'status':'observed_not_auto_approved'}
+          
+          def produce(now=None,fetch=query):
+              now=now or dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).date()
+              out={};errors={}
+              for sid,spec in SPECS.items():
+                  try:out[sid]=fetch(spec,now)
+                  except Exception as ex:errors[sid]=str(ex)[:90] if isinstance(ex,DataError) else type(ex).__name__
+                  print(sid+': '+('ok' if sid in out else 'unavailable'))
+              # Avoid overwriting previous published feed with widespread HTTP or token failures.
+              if len(out)<5 or not {'kr_treasury_3y_d','kr_base_d','kr_cpi_m'}.issubset(out):
+                  raise DataError('publication gate: essential data missing or insufficient valid series')
+              # KRX and third-party ECOS-republished series may have separate redistribution rights.
+              # Never publish all 19 raw sources on a public Pages site just because the API responded.
+              # Publish only the five narrowly mapped observations necessary for the app's staged trial.
+              # The publisher must still confirm that the ECOS terms allow this use before enabling Pages.
+              trial_ids=('kr_base_d','kr_treasury_3y_d','kr_cpi_m','ppi_m','exports_m')
+              published={sid:out[sid] for sid in trial_ids if sid in out}
+              if len(published)<len(trial_ids):raise DataError('publication gate: five staged series incomplete')
+              return {'schema':'NT_ECOS_LIVE_V245','generatedAt':dt.datetime.now(dt.timezone.utc).isoformat().replace('+00:00','Z'),
+                'provider':'한국은행 ECOS', 'sourceCount':len(published),'collectedSourceCount':len(out),'expectedSourceCount':len(SPECS),
+                'displayIndicatorsPreserved':54, 'sources':published,
+                'policy':'five staged candidates, public observations, BOK ECOS credited; verify applicable redistribution terms'}
+          
+          def main():
+              if not SECRET:print('ECOS_API_KEY secret missing');return 2
+              try:data=produce()
+              except DataError as ex:print('No publication: '+str(ex));return 2
+              path=ROOT/'site/ecos/feed.json';path.parent.mkdir(parents=True,exist_ok=True)
+              path.write_text(json.dumps(data,ensure_ascii=False,separators=(',',':'),allow_nan=False)+'\n',encoding='utf-8')
+              (ROOT/'site/index.html').write_text('<!doctype html><meta charset="utf-8"><title>SNOWBALL ECOS public read-only feed</title><p>ECOS observational market statistics</p>',encoding='utf-8')
+              print('Validated feed saved; sources:',data['sourceCount'],'No credentials published.')
+              return 0
+          if __name__=='__main__':raise SystemExit(main())
+          PYECOS
+      - name: Configure public Pages
+        uses: actions/configure-pages@v5
+      - name: Upload only the generated public site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - name: Publish feed
+        uses: actions/deploy-pages@v4
