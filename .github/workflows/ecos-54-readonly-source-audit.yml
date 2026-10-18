@@ -1,0 +1,226 @@
+name: Snowball ECOS 54 Read-only Source Audit
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect-ecos-source-pipeline:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    timeout-minutes: 20
+    steps:
+      - name: Audit ECOS 19 original sources and the published snapshot without changing anything
+        shell: bash
+        env:
+          ECOS_API_KEY: ${{ secrets.ECOS_API_KEY }}
+        run: |
+          set -euo pipefail
+          cat > audit_ecos_54.py <<'PY_ECOS_AUDIT'
+          #!/usr/bin/env python3
+          """Read-only ECOS 54-indicator gate audit, no re-publication. Outputs safe metadata only."""
+          import csv
+          import datetime as dt
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          CATALOG={'sources': {'fx_d': {'name': '원/달러 환율', 'table': '731Y001', 'item': '0000001', 'cycle': 'D', 'unit': '원'}, 'kr_base_d': {'name': '한국 기준금리', 'table': '722Y001', 'item': '0101000', 'cycle': 'D', 'unit': '연%'}, 'kr_treasury_3y_d': {'name': '한국 국고채 3년물', 'table': '817Y002', 'item': '010200000', 'cycle': 'D', 'unit': '연%'}, 'kr_treasury_10y_d': {'name': '한국 국고채 10년물', 'table': '817Y002', 'item': '010210000', 'cycle': 'D', 'unit': '연%'}, 'us_cpi_m': {'name': '미국 CPI(지수)', 'table': '902Y008', 'item': 'US', 'cycle': 'M', 'unit': '지수 '}, 'kospi_d': {'name': 'KOSPI 일별 지수', 'table': '802Y001', 'item': '0001000', 'cycle': 'D', 'unit': '1980.01.04=100 '}, 'kosdaq_d': {'name': 'KOSDAQ 일별 지수', 'table': '802Y001', 'item': '0089000', 'cycle': 'D', 'unit': '1996.07.01=1000'}, 'kospi_foreign_d': {'name': 'KOSPI 외국인 순매수(억원)', 'table': '802Y001', 'item': '0030000', 'cycle': 'D', 'unit': '억원'}, 'kosdaq_foreign_d': {'name': 'KOSDAQ 외국인 순매수(억원)', 'table': '802Y001', 'item': '0113000', 'cycle': 'D', 'unit': '억원'}, 'us_policy_m': {'name': '미국 정책금리 월별 후보', 'table': '902Y006', 'item': 'US', 'cycle': 'M', 'unit': '%'}, 'exports_m': {'name': '한국 총수출금액 월별 후보', 'table': '901Y118', 'item': 'T002', 'cycle': 'M', 'unit': '천불'}, 'kr_cpi_m': {'name': '한국 소비자물가지수 총지수', 'table': '901Y009', 'item': '0', 'cycle': 'M', 'unit': '2020=100'}, 'import_price_m': {'name': '한국 수입물가지수 총지수', 'table': '401Y015', 'item': '*AA', 'cycle': 'M', 'unit': '2020=100'}, 'ppi_m': {'name': '한국 생산자물가지수 총지수', 'table': '404Y014', 'item': '*AA', 'cycle': 'M', 'unit': '2020=100'}, 'customer_deposit_m': {'name': '투자자 예탁금 월별', 'table': '901Y056', 'item': 'S23A', 'cycle': 'M', 'unit': '원'}, 'credit_balance_m': {'name': '신용융자 잔고 월별', 'table': '901Y056', 'item': 'S23E', 'cycle': 'M', 'unit': '원'}, 'wti_m': {'name': 'WTI 월별', 'table': '902Y003', 'item': '010101', 'cycle': 'M', 'unit': '달러/배럴'}, 'gold_m': {'name': '금 월별', 'table': '902Y003', 'item': '040101', 'cycle': 'M', 'unit': '달러/트로이온스'}, 'copper_m': {'name': '구리 월별', 'table': '902Y003', 'item': '040202', 'cycle': 'M', 'unit': '달러/톤'}}, 'mapping': [{'group': '시장환경', 'no': 1, 'name': '원/달러 환율', 'source_ids': ['fx_d'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 2, 'name': '원/달러 환율 변동성', 'source_ids': ['fx_d'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 3, 'name': '한국은행 기준금리', 'source_ids': ['kr_base_d'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 4, 'name': '미국 연준 기준금리', 'source_ids': ['us_policy_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 5, 'name': '한국 국고채 3년물', 'source_ids': ['kr_treasury_3y_d'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 6, 'name': '미국 국채 10년물', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 7, 'name': '미국 국채 2년물', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 8, 'name': '미국 10년-2년물 금리차', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 9, 'name': '미국 국채 10년물 20일선', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 10, 'name': '한국 수출증가율(YoY)', 'source_ids': ['exports_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 11, 'name': '대만 수출증가율(YoY)', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 12, 'name': '한국 반도체 수출액', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 13, 'name': '한국 반도체 출하량', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 14, 'name': '반도체 가격', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 15, 'name': '반도체 재고', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 16, 'name': '미국 ISM 제조업 PMI', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 17, 'name': 'OECD 경기선행지수 CLI', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 18, 'name': '한국 CPI', 'source_ids': ['kr_cpi_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 19, 'name': '한국 수입물가지수', 'source_ids': ['import_price_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 20, 'name': '한국 PPI', 'source_ids': ['ppi_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 21, 'name': '미국 CPI', 'source_ids': ['us_cpi_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 22, 'name': '미국 근원 CPI', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 23, 'name': '미국 10년 BEI', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 24, 'name': 'WTI', 'source_ids': ['wti_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 25, 'name': 'WTI 60일 평균', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 26, 'name': 'CNN 공포·탐욕지수', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 27, 'name': '외국인 최근 20거래일 누적 순매수', 'source_ids': ['kospi_foreign_d', 'kosdaq_foreign_d'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 28, 'name': '고객예탁금', 'source_ids': ['customer_deposit_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 29, 'name': '신용융자 잔고', 'source_ids': ['credit_balance_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 30, 'name': '신용잔고율', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 31, 'name': 'VKOSPI', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '시장환경', 'no': 32, 'name': 'KOSDAQ 외국인 순매수', 'source_ids': ['kosdaq_foreign_d'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '시장환경', 'no': 33, 'name': 'KOSDAQ 기관 순매수', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '상관지표', 'no': 1, 'name': 'KOSPI', 'source_ids': ['kospi_d'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '상관지표', 'no': 2, 'name': 'KOSDAQ', 'source_ids': ['kosdaq_d'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '상관지표', 'no': 3, 'name': 'S&P500', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '상관지표', 'no': 4, 'name': 'NASDAQ', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '상관지표', 'no': 5, 'name': 'VIX', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '상관지표', 'no': 6, 'name': '원/달러 환율', 'source_ids': ['fx_d'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '상관지표', 'no': 7, 'name': '미국 국채 10년물', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '상관지표', 'no': 8, 'name': 'WTI', 'source_ids': ['wti_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '상관지표', 'no': 9, 'name': '달러인덱스 DXY', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '상관지표', 'no': 10, 'name': '필라델피아반도체지수 SOX', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '상관지표', 'no': 11, 'name': '러셀2000', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '상관지표', 'no': 12, 'name': '금 가격', 'source_ids': ['gold_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '상관지표', 'no': 13, 'name': '구리 가격', 'source_ids': ['copper_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '상관지표', 'no': 14, 'name': '미국 하이일드채', 'source_ids': [], 'strategy': 'KEEP_EXTERNAL'}, {'group': '상관지표', 'no': 15, 'name': '한국 국고채 3년물', 'source_ids': ['kr_treasury_3y_d'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '상관지표', 'no': 16, 'name': '한국 국고채 10년물', 'source_ids': ['kr_treasury_10y_d'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '상관지표', 'no': 17, 'name': '한국 기준금리', 'source_ids': ['kr_base_d'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '상관지표', 'no': 18, 'name': '미국 정책금리', 'source_ids': ['us_policy_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '상관지표', 'no': 19, 'name': '미국 CPI', 'source_ids': ['us_cpi_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '상관지표', 'no': 20, 'name': '국내 외국인 순매수', 'source_ids': ['kospi_foreign_d', 'kosdaq_foreign_d'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}, {'group': '상관지표', 'no': 21, 'name': '증시주변자금', 'source_ids': ['customer_deposit_m', 'credit_balance_m'], 'strategy': 'ECOS_CANDIDATE_REVIEW'}]}
+          BASE_IDS=['kr_base_d','kr_treasury_3y_d','kr_cpi_m','ppi_m','exports_m']
+          OPTIONAL_IDS=['fx_d','customer_deposit_m','credit_balance_m']
+          PUBLIC_URL='https://smowball-912167.github.io/snowball-ecos-feed/ecos/feed.json'
+          OUT=Path('ecos-54-gate-results')
+          KST=dt.timezone(dt.timedelta(hours=9))
+          TODAY=dt.datetime.now(KST).date()
+
+
+          def source_route(sid):
+              if sid in BASE_IDS: return 'PUBLIC_BASE_CONFIGURED'
+              if sid in OPTIONAL_IDS: return 'VARIABLE_APPROVAL_REQUIRED'
+              return 'NOT_IN_PUBLIC_WORKFLOW'
+
+
+          def date_age(time,cycle):
+              parsed=dt.datetime.strptime(time,'%Y%m%d' if cycle=='D' else '%Y%m').date()
+              return (TODAY-parsed).days
+
+
+          def response_check(sid,spec,api_key):
+              if not re.fullmatch(r'[A-Za-z0-9_-]{8,128}',api_key or ''):
+                  return {'status':'KEY_MISSING_OR_INVALID','valid_points':0}
+              cycle=spec['cycle']; start=(TODAY-dt.timedelta(days=430)).strftime('%Y%m%d') if cycle=='D' else f'{TODAY.year-4}01'
+              end=TODAY.strftime('%Y%m%d' if cycle=='D' else '%Y%m')
+              params=['StatisticSearch',api_key,'json','kr','1','900',spec['table'],cycle,start,end,spec['item']]
+              url='https://ecos.bok.or.kr/api/'+'/'.join(urllib.parse.quote(x,safe='') for x in params)
+              # The ECOS key is in the URL path: NEVER print raw URLs, response bodies or exceptions.
+              try:
+                  req=urllib.request.Request(url,headers={'Accept':'application/json','User-Agent':'SNOWBALL-ECOS-AUDIT/2.0'})
+                  with urllib.request.urlopen(req,timeout=35) as response:
+                      if response.status!=200 or response.geturl()!=url:
+                          return {'status':'HTTP_STATUS_OR_REDIRECT','valid_points':0}
+                      body=response.read(3_000_001)
+                  if len(body)>3_000_000: return {'status':'BODY_TOO_LARGE','valid_points':0}
+                  payload=json.loads(body)
+              except urllib.error.HTTPError as ex:
+                  return {'status':'HTTP_ERROR_'+str(ex.code),'valid_points':0}
+              except Exception as ex:
+                  # Do not serialize repr(ex), str(ex), tracebacks: could contain the API key URL.
+                  return {'status':'REQUEST_ERROR_'+type(ex).__name__,'valid_points':0}
+              block=payload.get('StatisticSearch') if isinstance(payload,dict) else None
+              if not isinstance(block,dict) or not isinstance(block.get('row'),list):
+                  code=str((payload.get('RESULT') or {}).get('CODE','')) if isinstance(payload,dict) else ''
+                  return {'status':'API_NO_ROWS' + ('_'+code if re.fullmatch(r'[A-Za-z0-9_-]{1,15}',code) else ''),'valid_points':0}
+              rows=block['row']
+              total_text=str(block.get('list_total_count','0')).replace(',','')
+              raw_count=int(total_text) if total_text.isdigit() else 0
+              if raw_count>len(rows):return {'status':'PAGINATION_REQUIRED','valid_points':0,'row_count':len(rows),'total_rows':raw_count}
+              expected_unit=re.sub(r'\s+','',spec['unit'])
+              seen={}; other_dimensions=set(); rejected=0; wrong_unit=0
+              for r in rows:
+                  if not isinstance(r,dict) or str(r.get('STAT_CODE',''))!=spec['table'] or str(r.get('ITEM_CODE1',''))!=spec['item']:
+                      rejected+=1;continue
+                  if re.sub(r'\s+','',str(r.get('UNIT_NAME','')))!=expected_unit:
+                      wrong_unit+=1;continue
+                  t=str(r.get('TIME','')); txt=str(r.get('DATA_VALUE','')).strip().replace(',','')
+                  if not re.fullmatch(r'20\d{6}' if cycle=='D' else r'20\d{4}',t):rejected+=1;continue
+                  try:
+                      value=float(txt);date_age(t,cycle)
+                  except (ValueError,OverflowError):rejected+=1;continue
+                  if not (-1e16<value<1e16):rejected+=1;continue
+                  dim=tuple(str(r.get('ITEM_CODE'+str(i),'') or '') for i in (2,3,4))
+                  other_dimensions.add(dim)
+                  if t in seen and seen[t]!=(dim,value):
+                      return {'status':'AMBIGUOUS_DIMENSIONS','valid_points':0,'dimension_count':len(other_dimensions)}
+                  seen[t]=(dim,value)
+              if not seen:return {'status':'NO_EXACT_MATCH','valid_points':0,'wrong_unit_rows':wrong_unit,'other_rows':rejected}
+              if len(other_dimensions)>1:return {'status':'AMBIGUOUS_DIMENSIONS','valid_points':0,'dimension_count':len(other_dimensions)}
+              latest=max(seen)
+              n=len(seen)
+              if n<(10 if cycle=='D' else 13):return {'status':'INSUFFICIENT_HISTORY','valid_points':n,'latest_date':latest}
+              age=date_age(latest,cycle)
+              if age< -1:return {'status':'FUTURE_DATE','valid_points':n,'latest_date':latest}
+              max_days=(160 if spec['table']=='722Y001' else 12) if cycle=='D' else (150 if spec['item']=='US' else 105)
+              if age>max_days:return {'status':'STALE','valid_points':n,'latest_date':latest,'age_days':age}
+              return {'status':'SOURCE_OBSERVED_NOT_APPROVED','valid_points':n,'latest_date':latest,'age_days':age,'dimension_count':len(other_dimensions)}
+
+
+          def public_snapshot():
+              try:
+                  req=urllib.request.Request(PUBLIC_URL,headers={'User-Agent':'SNOWBALL-ECOS-AUDIT/2.0'})
+                  with urllib.request.urlopen(req,timeout=20) as r:
+                      if r.status!=200:return {'status':'HTTP_STATUS_ERROR'}
+                      body=r.read(1_600_001)
+                  if len(body)>1_600_000:return {'status':'BODY_TOO_LARGE'}
+                  x=json.loads(body)
+                  if x.get('schema')!='NT_ECOS_LIVE_V245' or not isinstance(x.get('sources'),dict):
+                      return {'status':'SCHEMA_MISMATCH'}
+                  ids=sorted(x['sources'])
+                  timestamp=str(x.get('generatedAt',''))
+                  agehours=None
+                  try:
+                      instant=dt.datetime.fromisoformat(timestamp.replace('Z','+00:00'))
+                      agehours=round((dt.datetime.now(dt.timezone.utc)-instant).total_seconds()/3600,1)
+                  except Exception: pass
+                  mismatched=[]
+                  for sid,source in x['sources'].items():
+                      expect=CATALOG['sources'].get(sid)
+                      if (not isinstance(source,dict) or not expect or
+                          any(str(source.get(k,''))!=str(expect[k]) for k in ('table','item','cycle','unit')) or
+                          source.get('status')!='observed_not_auto_approved'):
+                          mismatched.append(sid)
+                  actual=len(ids)
+                  claimed=x.get('sourceCount')
+                  status='PUBLISHED'
+                  if mismatched: status='SOURCE_METADATA_MISMATCH'
+                  elif actual!=claimed: status='SOURCE_COUNT_MISMATCH'
+                  elif agehours is None: status='UNKNOWN_PUBLIC_AGE'
+                  elif agehours>72 or agehours< -24: status='STALE_PUBLIC_FEED'
+                  return {'status':status,'generatedAt':timestamp,'ageHours':agehours,'sourceIds':ids,
+                    'sourceCount':actual,'reportedCount':claimed,'invalidSourceIds':mismatched}
+              except Exception as ex:
+                  return {'status':'REQUEST_ERROR_'+type(ex).__name__}
+
+
+          def indicator_rows(per_source,feed):
+              visible=set(feed.get('sourceIds',[])) if feed.get('status')=='PUBLISHED' else set()
+              result=[]
+              for r in CATALOG['mapping']:
+                  sid=r['source_ids'];st=r['strategy']
+                  if st=='KEEP_EXTERNAL':
+                      layer='EXTERNAL_PRESERVED'; detail='ECOS 대체 금지; 기존 외부 원천 점검'
+                  elif not sid:
+                      layer='NO_ECOS_MAPPING';detail='원천 정의 검증 필요'
+                  else:
+                      flags=[per_source.get(s,{}).get('status','NOT_CHECKED') for s in sid]
+                      if any(f!='SOURCE_OBSERVED_NOT_APPROVED' for f in flags):
+                          layer='SOURCE_GATE_NOT_PASSED';detail=' | '.join(f'{s}:{f}' for s,f in zip(sid,flags))
+                      elif any(s not in visible for s in sid):
+                          layer='NOT_IN_CURRENT_PUBLIC_FEED';detail='조회됨(자동 연결 아님); 공개/권리 및 앱 연결 검증 필요'
+                      elif any(s not in BASE_IDS for s in sid):
+                          layer='PUBLIC_ADDITIONAL_MANUAL_REVIEW';detail='공개됨(정의·주기·앱 연결 확인 필요)'
+                      else:
+                          layer='PUBLIC_BASE_PRESENT_NOT_DEVICE_VERIFIED';detail='공개됨(앱 수신과 화면 표시는 미검증)'
+                  result.append({'group':r['group'],'no':r['no'],'indicator':r['name'],'source_ids':','.join(sid),
+                                 'strategy':st,'pipeline_status':layer,'detail':detail,'device_verified':False})
+              return result
+
+
+          def write_csv(path,rows):
+              with path.open('w',newline='',encoding='utf-8-sig') as f:
+                  writer=csv.DictWriter(f,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
+
+
+          def main():
+              OUT.mkdir(parents=True,exist_ok=True)
+              key=os.environ.get('ECOS_API_KEY','')
+              per_source={}
+              for sid,spec in CATALOG['sources'].items():
+                  record=response_check(sid,spec,key)
+                  per_source[sid]=record
+                  # sanitized status only
+                  print(f'{sid}: {record["status"]}')
+              feed=public_snapshot()
+              print('public_feed:',feed.get('status','UNKNOWN'),'count:',feed.get('sourceCount','?'))
+              items=indicator_rows(per_source,feed)
+              rows=[{'source_id':sid,'name':spec['name'],'table':spec['table'],'item':spec['item'],
+                     'cycle':spec['cycle'],'unit':spec['unit'],'publish_route':source_route(sid),
+                     **per_source[sid]} for sid,spec in CATALOG['sources'].items()]
+              # Normalize optional output dictionary fields so every row has same columns.
+              cols=list(dict.fromkeys(k for row in rows for k in row))
+              rows=[{c:r.get(c,'') for c in cols} for r in rows]
+              write_csv(OUT/'sources_19.csv',rows)
+              write_csv(OUT/'indicators_54.csv',items)
+              payload={'schema':'NT_ECOS_54_DIAG_V2','runAt':dt.datetime.now(dt.timezone.utc).isoformat(),
+                'proofLevel':'read-only source retrieval & published metadata; never device verification',
+                'sourceResults':{sid:{'name':CATALOG['sources'][sid]['name'],'publishRoute':source_route(sid),**rec} for sid,rec in per_source.items()},
+                'publicFeed':feed,'mapping':items,'noAutomaticSwitch':True,'noAppMutation':True,
+                'noPublicDataRepublishing':True}
+              (OUT/'ecos_54_readonly_audit.json').write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8')
+              stats={}
+              for r in per_source.values():stats[r['status']]=stats.get(r['status'],0)+1
+              (OUT/'README.txt').write_text(
+                'SNOWBALL ECOS 54 read-only audit\n'
+                '19 unique ECOS candidates, 54 display slots. No APK changes.\n'
+                'Statuses are gate/evidence classes, NOT official approval or device success.\n'
+                '19 source counts: '+json.dumps(stats,ensure_ascii=False)+'\n'
+                'PUBLIC gate: '+feed.get('status','UNKNOWN')+'\n'
+                'Do not put credentials in screenshot/chat or public files.\n',encoding='utf-8')
+              assert len(items)==54 and len(per_source)==19
+              return 0
+
+          if __name__=='__main__':raise SystemExit(main())
+          PY_ECOS_AUDIT
+          python3 audit_ecos_54.py
+      - name: Upload metadata-only results (19 sources, 54 indicator slots)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ECOS-54-SOURCE-PIPELINE-DIAG
+          path: ecos-54-gate-results/
+          if-no-files-found: warn
+          retention-days: 7
