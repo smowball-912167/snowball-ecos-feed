@@ -101,17 +101,38 @@ jobs:
 
           def produce(fetch=query,now=None):
               now=now or dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).date()
-              ids=selected();result={}
-              for sid in ids:
-                  # Partial publish forbidden: retain last successful snapshot if a required/approved source fails.
+              ids=selected()  # Only explicitly approved extra IDs can be requested.
+              result={};optional_skipped=[]
+              # Preserve the core feed gate: all five default sources must pass validation.
+              for sid in BASIC:
                   try:result[sid]=fetch(sid,now)
-                  except GateError as e:raise GateError('NO_PUBLISH_'+sid+'_'+str(e)) from None
+                  except GateError as e:
+                      # Query GateError is a short controlled code. Never expose request URLs or tokens.
+                      reason=str(e) if re.fullmatch(r'[A-Z_]{2,50}',str(e)) else 'VALIDATION_FAILED'
+                      raise GateError('NO_PUBLISH_CORE_'+sid+'_'+reason) from None
+                  except Exception:
+                      raise GateError('NO_PUBLISH_CORE_'+sid+'_UNEXPECTED') from None
                   print(sid+': OK')
-              if len(result)!=len(ids):raise GateError('INCOMPLETE_PUBLISH')
+              # An optional approved source can be unavailable without stopping updates of core 5.
+              # Never populate a missing source with fabricated, stale or mismatched values.
+              for sid in ids:
+                  if sid in BASIC:continue
+                  try:result[sid]=fetch(sid,now)
+                  except GateError as e:
+                      reason=str(e) if re.fullmatch(r'[A-Z_]{2,50}',str(e)) else 'VALIDATION_FAILED'
+                      optional_skipped.append(sid)
+                      print(sid+': SKIPPED_'+reason)
+                  except Exception:
+                      optional_skipped.append(sid)
+                      print(sid+': SKIPPED_UNEXPECTED')
+                  else:print(sid+': OK')
+              if not all(sid in result for sid in BASIC):raise GateError('CORE_INCOMPLETE')
+              print('optional sources skipped',len(optional_skipped))
               return {'schema':'NT_ECOS_LIVE_V245','generatedAt':dt.datetime.now(dt.timezone.utc).isoformat().replace('+00:00','Z'),
                       'provider':'한국은행 ECOS','sourceCount':len(result),'expectedSourceCount':len(ids),
+                      'skippedOptionalCount':len(optional_skipped),
                       'displayIndicatorsPreserved':54,'sources':result,
-                      'policy':'5 existing base sources plus explicit source-level publication approvals; monthly values never daily replacements'}
+                      'policy':'5 mandatory core sources; independently validated approved optional sources; monthly never daily replacements'}
 
           def main():
               try:doc=produce()
