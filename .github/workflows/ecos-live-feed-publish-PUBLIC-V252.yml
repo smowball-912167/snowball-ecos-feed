@@ -24,7 +24,6 @@ jobs:
           ECOS_API_KEY: ${{ secrets.ECOS_API_KEY }}
           ECOS_15_PUBLIC_APPROVED_IDS: ${{ vars.ECOS_15_PUBLIC_APPROVED_IDS }}
           ECOS_V252_PUBLIC_APPROVED_IDS: ${{ vars.ECOS_V252_PUBLIC_APPROVED_IDS }}
-          ECOS_IMPORT_PRICE_ITEM_CODE2_C_METADATA_VERIFIED: ${{ vars.ECOS_IMPORT_PRICE_ITEM_CODE2_C_METADATA_VERIFIED }}
         run: |
           set -euo pipefail
           python3 - <<'PY_ECOS_V252'
@@ -46,8 +45,9 @@ jobs:
               old=set(filter(None,(x.strip() for x in os.environ.get('ECOS_15_PUBLIC_APPROVED_IDS','').split(','))))
               new=set(filter(None,(x.strip() for x in os.environ.get('ECOS_V252_PUBLIC_APPROVED_IDS','').split(','))))
               if not old.issubset(LEGACY_EXTRA) or not new.issubset(REST):raise GateError('APPROVAL_IDS_INVALID')
-              if 'import_price_m' in new and os.environ.get('ECOS_IMPORT_PRICE_ITEM_CODE2_C_METADATA_VERIFIED')!='true':
-                  raise GateError('IMPORT_PRICE_DIMENSION_UNVERIFIED')
+              # Selection only enables attempting the lookup. 401Y015 dimension semantics
+              # are validated against the actual ECOS item name during query(), not by
+              # blindly trusting a manually entered metadata-verified environment flag.
               return list(BASIC)+sorted(old|new)
 
           def query(sid,now):
@@ -77,8 +77,15 @@ jobs:
                   if str(row.get('STAT_CODE',''))!=s['table'] or str(row.get('ITEM_CODE1',''))!=s['item']:continue
                   unit=re.sub(r'\s+','',str(row.get('UNIT_NAME','')))
                   if unit!=re.sub(r'\s+','',s['unit']):continue
-                  codes=tuple(str(row.get('ITEM_CODE'+str(i),'') or '') for i in (2,3,4))
-                  if sid=='import_price_m' and codes[0]!='C':continue
+                  codes=tuple(str(row.get('ITEM_CODE'+str(i),'') or '').strip() for i in (2,3,4))
+                  if sid=='import_price_m':
+                      if codes[0]!='C':continue
+                      # C is a historical candidate, NOT proof that the requested
+                      # statistic is KRW-denominated. Check the name shipped by ECOS.
+                      # Blank, different-currency and contradictory names must not pass.
+                      item_name2=re.sub(r'\s+', '',str(row.get('ITEM_NAME2','') or ''))
+                      if '원화기준' not in item_name2 or '계약통화' in item_name2:
+                          raise GateError('IMPORT_PRICE_C_NAME_UNVERIFIED')
                   period=str(row.get('TIME',''))
                   if not re.fullmatch(r'20\d{6}' if cycle=='D' else r'20\d{4}',period):continue
                   raw=str(row.get('DATA_VALUE','')).replace(',','').strip()
@@ -96,7 +103,10 @@ jobs:
               out={'name':s['name'],'table':s['table'],'item':s['item'],'cycle':cycle,'unit':s['unit'].strip(),
                    'latest':recent,'value':data[recent][0],'history':[[t,data[t][0]] for t in dates[-440:]],
                    'status':'observed_not_auto_approved'}
-              if sid=='import_price_m':out['dimensionResolution']='ITEM_CODE2_C_VALIDATED'
+              if sid=='import_price_m':
+                  # This flag is consumed by V252's app receiver. Emit only following
+                  # successful value, date, unit, dimension and ECOS item-name checks.
+                  out['dimensionResolution']='ITEM_CODE2_C_VALIDATED'
               return out
 
           def produce(fetch=query,now=None):
