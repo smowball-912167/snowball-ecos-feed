@@ -1,0 +1,132 @@
+name: Snowball ECOS Daily Public Feed
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '10 23 * * *' # 08:10 KST, best effort
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: snowball-ecos-feed-pages
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    timeout-minutes: 20
+    steps:
+      - name: Query authorized source list and build non-secret public feed
+        shell: bash
+        env:
+          ECOS_API_KEY: ${{ secrets.ECOS_API_KEY }}
+          ECOS_15_PUBLIC_APPROVED_IDS: ${{ vars.ECOS_15_PUBLIC_APPROVED_IDS }}
+          ECOS_V252_PUBLIC_APPROVED_IDS: ${{ vars.ECOS_V252_PUBLIC_APPROVED_IDS }}
+          ECOS_IMPORT_PRICE_ITEM_CODE2_C_METADATA_VERIFIED: ${{ vars.ECOS_IMPORT_PRICE_ITEM_CODE2_C_METADATA_VERIFIED }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_ECOS_V252'
+          #!/usr/bin/env python3
+          """V252: separately approved ECOS -> public feed, fail closed, no credentials logged.
+          Default is the same 5 source observations as V251. New source IDs require
+          per-series redistribution permission and matching frequency/definition validation.
+          """
+          import datetime as dt, json, os, re, urllib.request, urllib.parse
+          from pathlib import Path
+          C = {'fx_d': {'name': '원/달러 환율', 'table': '731Y001', 'item': '0000001', 'cycle': 'D', 'unit': '원'}, 'kr_base_d': {'name': '한국 기준금리', 'table': '722Y001', 'item': '0101000', 'cycle': 'D', 'unit': '연%'}, 'kr_treasury_3y_d': {'name': '한국 국고채 3년물', 'table': '817Y002', 'item': '010200000', 'cycle': 'D', 'unit': '연%'}, 'kr_treasury_10y_d': {'name': '한국 국고채 10년물', 'table': '817Y002', 'item': '010210000', 'cycle': 'D', 'unit': '연%'}, 'us_cpi_m': {'name': '미국 CPI(지수)', 'table': '902Y008', 'item': 'US', 'cycle': 'M', 'unit': '지수 '}, 'kospi_d': {'name': 'KOSPI 일별 지수', 'table': '802Y001', 'item': '0001000', 'cycle': 'D', 'unit': '1980.01.04=100 '}, 'kosdaq_d': {'name': 'KOSDAQ 일별 지수', 'table': '802Y001', 'item': '0089000', 'cycle': 'D', 'unit': '1996.07.01=1000'}, 'kospi_foreign_d': {'name': 'KOSPI 외국인 순매수(억원)', 'table': '802Y001', 'item': '0030000', 'cycle': 'D', 'unit': '억원'}, 'kosdaq_foreign_d': {'name': 'KOSDAQ 외국인 순매수(억원)', 'table': '802Y001', 'item': '0113000', 'cycle': 'D', 'unit': '억원'}, 'us_policy_m': {'name': '미국 정책금리 월별 후보', 'table': '902Y006', 'item': 'US', 'cycle': 'M', 'unit': '%'}, 'exports_m': {'name': '한국 총수출금액 월별 후보', 'table': '901Y118', 'item': 'T002', 'cycle': 'M', 'unit': '천불'}, 'kr_cpi_m': {'name': '한국 소비자물가지수 총지수', 'table': '901Y009', 'item': '0', 'cycle': 'M', 'unit': '2020=100'}, 'import_price_m': {'name': '한국 수입물가지수 총지수', 'table': '401Y015', 'item': '*AA', 'cycle': 'M', 'unit': '2020=100'}, 'ppi_m': {'name': '한국 생산자물가지수 총지수', 'table': '404Y014', 'item': '*AA', 'cycle': 'M', 'unit': '2020=100'}, 'customer_deposit_m': {'name': '투자자 예탁금 월별', 'table': '901Y056', 'item': 'S23A', 'cycle': 'M', 'unit': '원'}, 'credit_balance_m': {'name': '신용융자 잔고 월별', 'table': '901Y056', 'item': 'S23E', 'cycle': 'M', 'unit': '원'}, 'wti_m': {'name': 'WTI 월별', 'table': '902Y003', 'item': '010101', 'cycle': 'M', 'unit': '달러/배럴'}, 'gold_m': {'name': '금 월별', 'table': '902Y003', 'item': '040101', 'cycle': 'M', 'unit': '달러/트로이온스'}, 'copper_m': {'name': '구리 월별', 'table': '902Y003', 'item': '040202', 'cycle': 'M', 'unit': '달러/톤'}}
+          BASIC=('kr_base_d','kr_treasury_3y_d','kr_cpi_m','ppi_m','exports_m')
+          LEGACY_EXTRA={'fx_d','customer_deposit_m','credit_balance_m'}
+          REST=set(C).difference(BASIC).difference(LEGACY_EXTRA)
+          KEY=os.environ.get('ECOS_API_KEY','')
+          class GateError(Exception): pass
+
+          def selected():
+              old=set(filter(None,(x.strip() for x in os.environ.get('ECOS_15_PUBLIC_APPROVED_IDS','').split(','))))
+              new=set(filter(None,(x.strip() for x in os.environ.get('ECOS_V252_PUBLIC_APPROVED_IDS','').split(','))))
+              if not old.issubset(LEGACY_EXTRA) or not new.issubset(REST):raise GateError('APPROVAL_IDS_INVALID')
+              if 'import_price_m' in new and os.environ.get('ECOS_IMPORT_PRICE_ITEM_CODE2_C_METADATA_VERIFIED')!='true':
+                  raise GateError('IMPORT_PRICE_DIMENSION_UNVERIFIED')
+              return list(BASIC)+sorted(old|new)
+
+          def query(sid,now):
+              s=C[sid]
+              if not re.fullmatch(r'[a-zA-Z0-9_-]{8,128}',KEY):raise GateError('KEY_MISSING')
+              cycle=s['cycle'];start=((now-dt.timedelta(days=430)).strftime('%Y%m%d') if cycle=='D' else f'{now.year-4}01')
+              end=now.strftime('%Y%m%d') if cycle=='D' else now.strftime('%Y%m')
+              args=['StatisticSearch',KEY,'json','kr','1','900',s['table'],cycle,start,end,s['item']]
+              url='https://ecos.bok.or.kr/api/'+'/'.join(urllib.parse.quote(x,safe='') for x in args)
+              try:
+                  req=urllib.request.Request(url,headers={'Accept':'application/json','User-Agent':'SNOWBALL-ECOS-approved-v252/1.0'})
+                  with urllib.request.urlopen(req,timeout=30) as resp:
+                      if resp.status!=200 or resp.geturl()!=url:raise GateError('HTTP')
+                      body=resp.read(3000001)
+                  if len(body)>3000000:raise GateError('RESPONSE_TOO_LARGE')
+                  blob=json.loads(body)
+              except Exception:
+                  # Never print exceptions: HTTP exception text can include the API key embedded in URL.
+                  raise GateError('ECOS_REQUEST_FAILED') from None
+              block=blob.get('StatisticSearch') if isinstance(blob,dict) else None
+              if not isinstance(block,dict) or not isinstance(block.get('row'),list):raise GateError('ECOS_INVALID_RESPONSE')
+              try:count=int(block.get('list_total_count',0))
+              except Exception:raise GateError('ECOS_BAD_ROW_COUNT') from None
+              if count>900:raise GateError('PAGINATION_REQUIRED')
+              data,dimensions={},set()
+              for row in block['row']:
+                  if str(row.get('STAT_CODE',''))!=s['table'] or str(row.get('ITEM_CODE1',''))!=s['item']:continue
+                  unit=re.sub(r'\s+','',str(row.get('UNIT_NAME','')))
+                  if unit!=re.sub(r'\s+','',s['unit']):continue
+                  codes=tuple(str(row.get('ITEM_CODE'+str(i),'') or '') for i in (2,3,4))
+                  if sid=='import_price_m' and codes[0]!='C':continue
+                  period=str(row.get('TIME',''))
+                  if not re.fullmatch(r'20\d{6}' if cycle=='D' else r'20\d{4}',period):continue
+                  raw=str(row.get('DATA_VALUE','')).replace(',','').strip()
+                  try:val=float(raw)
+                  except (ValueError,TypeError):continue
+                  if not (-1e16<val<1e16):continue
+                  if period in data and data[period]!=(val,codes):raise GateError('DUPLICATE_PERIOD_DIMENSION')
+                  data[period]=(val,codes);dimensions.add(codes)
+              if len(dimensions)>1:raise GateError('INCONSISTENT_DIMENSIONS')
+              if len(data)<(10 if cycle=='D' else 13):raise GateError('INSUFFICIENT_HISTORY')
+              dates=sorted(data);recent=dates[-1]
+              last=dt.datetime.strptime(recent,'%Y%m%d' if cycle=='D' else '%Y%m').date()
+              maxAge=160 if sid=='kr_base_d' else 12 if cycle=='D' else 105
+              if last>now+dt.timedelta(days=1) or (now-last).days>maxAge:raise GateError('STALE_OBSERVATION')
+              out={'name':s['name'],'table':s['table'],'item':s['item'],'cycle':cycle,'unit':s['unit'].strip(),
+                   'latest':recent,'value':data[recent][0],'history':[[t,data[t][0]] for t in dates[-440:]],
+                   'status':'observed_not_auto_approved'}
+              if sid=='import_price_m':out['dimensionResolution']='ITEM_CODE2_C_VALIDATED'
+              return out
+
+          def produce(fetch=query,now=None):
+              now=now or dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).date()
+              ids=selected();result={}
+              for sid in ids:
+                  # Partial publish forbidden: retain last successful snapshot if a required/approved source fails.
+                  try:result[sid]=fetch(sid,now)
+                  except GateError as e:raise GateError('NO_PUBLISH_'+sid+'_'+str(e)) from None
+                  print(sid+': OK')
+              if len(result)!=len(ids):raise GateError('INCOMPLETE_PUBLISH')
+              return {'schema':'NT_ECOS_LIVE_V245','generatedAt':dt.datetime.now(dt.timezone.utc).isoformat().replace('+00:00','Z'),
+                      'provider':'한국은행 ECOS','sourceCount':len(result),'expectedSourceCount':len(ids),
+                      'displayIndicatorsPreserved':54,'sources':result,
+                      'policy':'5 existing base sources plus explicit source-level publication approvals; monthly values never daily replacements'}
+
+          def main():
+              try:doc=produce()
+              except GateError as e:print('ECOS_GATE_FAIL',str(e));return 2
+              p=Path('site/ecos/feed.json');p.parent.mkdir(parents=True,exist_ok=True)
+              p.write_text(json.dumps(doc,ensure_ascii=False,separators=(',',':'),allow_nan=False)+'\n',encoding='utf-8')
+              Path('site/index.html').write_text('<!doctype html><meta charset="utf-8"><title>SNOWBALL ECOS feed</title><p>Published approved economic indicators sourced from Bank of Korea ECOS.</p>',encoding='utf-8')
+              print('OK public source count',doc['sourceCount']);return 0
+          if __name__=='__main__':raise SystemExit(main())
+          PY_ECOS_V252
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Upload public feed artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - name: Publish feed
+        uses: actions/deploy-pages@v4
