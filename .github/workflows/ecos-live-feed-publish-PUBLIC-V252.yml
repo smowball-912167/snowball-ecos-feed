@@ -214,6 +214,330 @@ jobs:
               print('OK public source count',doc['sourceCount']);return 0
           if __name__=='__main__':raise SystemExit(main())
           PY_ECOS_V252
+      - name: Build verified Korean daily deposits and credit finance feed
+        shell: bash
+        env:
+          DATA_GO_KR_SERVICE_KEY: ${{ secrets.DATA_GO_KR_SERVICE_KEY }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_FINANCE_V256'
+          """SNOWBALL V256, two approved daily statistics from Korean public-data API.
+          
+          Uses server-side DATA_GO_KR_SERVICE_KEY only.  No secret, request URL or raw API
+          response appears in log/artifact. Fail closed if either series fails validation.
+          The generated document exactly matches the existing V255 finance bridge schema.
+          """
+          from __future__ import annotations
+          
+          import datetime as dt
+          import json
+          import os
+          import re
+          import sys
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+          from pathlib import Path
+          
+          ENDPOINT = 'https://apis.data.go.kr/1160100/service/GetKofiaStatisticsInfoService'
+          SOURCES = {
+              'customerDeposits': ('getSecuritiesMarketTotalCapitalInfo','invrDpsgAmt','CUSTOMER_DEPOSITS'),
+              'creditBalance': ('getGrantingOfCreditBalanceInfo','crdTrFingWhl','CREDIT_LOANS_OUTSTANDING'),
+          }
+          PROVIDER = '금융위원회 금융투자협회종합통계정보'
+          SCHEMA = 'SNOWBALL_FINANCE_VERIFIED_V1'
+          KST = dt.timezone(dt.timedelta(hours=9))
+          MAX_RESPONSE = 2_000_000
+          
+          class GateError(Exception):
+              pass
+          
+          
+          def parse_date(s: str) -> dt.date:
+              if not isinstance(s,str) or not re.fullmatch(r'20\d{6}',s):
+                  raise GateError('BAD_DATE')
+              try: return dt.datetime.strptime(s,'%Y%m%d').date()
+              except ValueError: raise GateError('BAD_DATE') from None
+          
+          
+          def parse_xml(xml: bytes) -> tuple[list[dict],int]:
+              if not isinstance(xml,bytes) or len(xml)>MAX_RESPONSE or b'<!DOCTYPE' in xml.upper() or b'<!ENTITY' in xml.upper():
+                  raise GateError('UNSAFE_RESPONSE')
+              try: root=ET.fromstring(xml)
+              except ET.ParseError: raise GateError('BAD_XML') from None
+              if root.tag!='response' or root.findtext('./header/resultCode')!='00':
+                  raise GateError('NOT_NORMAL_SERVICE')
+              try: count=int(root.findtext('./body/totalCount'))
+              except (TypeError,ValueError): raise GateError('BAD_COUNT') from None
+              if count<0 or count>300: raise GateError('UNSUPPORTED_COUNT')
+              items=[]
+              for item in root.findall('./body/items/item'):
+                  fields={el.tag:(el.text or '').strip() for el in item}
+                  items.append(fields)
+              return items,count
+          
+          
+          def parse_series(xml: bytes, field: str, *, today: dt.date) -> list[list]:
+              items,count=parse_xml(xml)
+              if count==0 or len(items)!=count:
+                  raise GateError('ROW_COUNT_MISMATCH')
+              observed={}
+              for row in items:
+                  date=parse_date(row.get('basDt'))
+                  if date>today or date<today-dt.timedelta(days=90): raise GateError('OUT_OF_RANGE_DATE')
+                  raw=row.get(field,'')
+                  if not re.fullmatch(r'[0-9]{8,17}',raw): raise GateError('NOT_KRW_INTEGER')
+                  try: won=Decimal(raw)
+                  except InvalidOperation: raise GateError('INVALID_AMOUNT') from None
+                  # Field magnitudes in the observed government API response are in KRW.
+                  # Convert 원 -> 억원 by dividing by 100,000,000, not by 100 (백만원 assumption).
+                  eok=won/Decimal('100000000')
+                  if eok<Decimal('100') or eok>Decimal('5000000'):
+                      raise GateError('IMPOSSIBLE_AMOUNT')
+                  datekey=date.strftime('%Y%m%d')
+                  if datekey in observed:
+                      raise GateError('DUPLICATE_DAY')
+                  observed[datekey]=float(eok.quantize(Decimal('0.01'),rounding=ROUND_HALF_UP))
+              dates=sorted(observed)
+              if len(dates)<2 or today-parse_date(dates[-1])>dt.timedelta(days=14):
+                  raise GateError('INSUFFICIENT_OR_STALE')
+              return [[day,observed[day]] for day in dates]
+          
+          
+          def request_xml(secret: str, operation: str, today: dt.date, *, opener=None) -> bytes:
+              if not secret or len(secret)<20 or len(secret)>500: raise GateError('SERVICE_KEY_MISSING')
+              if operation not in (v[0] for v in SOURCES.values()): raise GateError('INVALID_OPERATION')
+              begin=(today-dt.timedelta(days=70)).strftime('%Y%m%d')
+              end=today.strftime('%Y%m%d')
+              # Use a single range query rather than guessing today's available basDt.
+              params={'serviceKey':secret,'numOfRows':'100','pageNo':'1',
+                      'beginBasDt':begin,'endBasDt':end}
+              url=ENDPOINT+'/'+operation+'?'+urllib.parse.urlencode(params)
+              req=urllib.request.Request(url,headers={'Accept':'application/xml',
+                                                      'User-Agent':'SNOWBALL-noncommercial-daily-finance/1.0'})
+              try:
+                  if opener is None: response=urllib.request.urlopen(req,timeout=25)
+                  else: response=opener(req,timeout=25)
+                  with response as stream:
+                      if stream.status!=200: raise GateError('HTTP_FAILED')
+                      response_bytes=stream.read(MAX_RESPONSE+1)
+                  if len(response_bytes)>MAX_RESPONSE: raise GateError('RESPONSE_TOO_LARGE')
+                  return response_bytes
+              except Exception:
+                  # Never print exception strings or request URLs: URL embeds serviceKey.
+                  raise GateError('API_REQUEST_FAILED') from None
+          
+          
+          def collect(*,secret: str, today: dt.date|None=None, fetcher=request_xml, now_utc:dt.datetime|None=None) -> dict:
+              today=today or dt.datetime.now(KST).date()
+              now_utc=now_utc or dt.datetime.now(dt.timezone.utc)
+              sources={}
+              for ident,(operation,field,definition) in SOURCES.items():
+                  rows=parse_series(fetcher(secret,operation,today),field,today=today)
+                  sources[ident]={'definition':definition,'cycle':'D','unit':'억원',
+                                  'provider':PROVIDER,'licenseReviewed':True,
+                                  'latest':rows[-1][0],'value':rows[-1][1],'history':rows}
+              return {'schema':SCHEMA,'publisher':'SNOWBALL-APPROVED-SOURCES',
+                      'generatedAt':now_utc.isoformat().replace('+00:00','Z'),
+                      'sources':sources}
+          
+          
+          def preserve_previous(*,now_utc:dt.datetime|None=None, fetch=None):
+              """Best-effort carry-forward of a *recent verified* public snapshot, unchanged."""
+              now_utc=now_utc or dt.datetime.now(dt.timezone.utc)
+              public_url='https://smowball-912167.github.io/snowball-ecos-feed/market/finance.json'
+              try:
+                  if fetch is None:
+                      req=urllib.request.Request(public_url,headers={'User-Agent':'SNOWBALL-daily-finance-fallback/1.0'})
+                      with urllib.request.urlopen(req,timeout=8) as r:
+                          if r.status!=200: return False
+                          blob=r.read(MAX_RESPONSE+1)
+                  else: blob=fetch(public_url)
+                  if not isinstance(blob,bytes) or len(blob)>MAX_RESPONSE: return False
+                  doc=json.loads(blob)
+                  when=dt.datetime.fromisoformat(str(doc.get('generatedAt','')).replace('Z','+00:00'))
+                  if when.tzinfo is None or not dt.timedelta(0)<=now_utc-when<dt.timedelta(hours=48):return False
+                  if doc.get('schema')!=SCHEMA or doc.get('publisher')!='SNOWBALL-APPROVED-SOURCES':return False
+                  sources=doc.get('sources')
+                  if not isinstance(sources,dict) or set(sources)!=set(SOURCES):return False
+                  for sid,(_,_,definition) in SOURCES.items():
+                      obs=sources[sid]
+                      if obs.get('definition')!=definition or obs.get('cycle')!='D' or obs.get('unit')!='억원' or obs.get('provider')!=PROVIDER or obs.get('licenseReviewed') is not True:return False
+                      hist=obs.get('history')
+                      if not isinstance(hist,list) or len(hist)<2 or obs.get('latest')!=hist[-1][0] or obs.get('value')!=hist[-1][1]:return False
+                  path=Path('site/market/finance.json')
+                  path.parent.mkdir(parents=True,exist_ok=True)
+                  path.write_bytes(blob)
+                  return True
+              except Exception:
+                  # Don't expose URLs, credentials or unexpected upstream response details.
+                  return False
+          
+          
+          def main():
+              key=os.environ.get('DATA_GO_KR_SERVICE_KEY','')
+              if not key:
+                  kept=preserve_previous()
+                  print('FINANCE: SKIPPED_NO_SECRET; old verified snapshot preserved' if kept else 'FINANCE: SKIPPED_NO_SECRET')
+                  return 0
+              try: doc=collect(secret=key)
+              except (GateError,ValueError):
+                  kept=preserve_previous()
+                  print('FINANCE: validation failed; preserved last verified snapshot' if kept else 'FINANCE: SKIPPED, validation failed (secret withheld)')
+                  return 0
+              except Exception:
+                  kept=preserve_previous()
+                  print('FINANCE: upstream failure; preserved last verified snapshot' if kept else 'FINANCE: SKIPPED, upstream failure (secret withheld)')
+                  return 0
+              path=Path('site/market/finance.json')
+              path.parent.mkdir(parents=True,exist_ok=True)
+              path.write_text(json.dumps(doc,ensure_ascii=False,separators=(',',':'),allow_nan=False)+'\n',encoding='utf-8')
+              print('FINANCE: OK, 2 verified sources; latest='+doc['sources']['customerDeposits']['latest']+'; generated finance.json')
+              return 0
+          
+          if __name__=='__main__': sys.exit(main())
+          PY_FINANCE_V256
+      - name: Add licensed ECOS foreign flow to existing finance feed (default off)
+        shell: bash
+        env:
+          ECOS_API_KEY: ${{ secrets.ECOS_API_KEY }}
+          SNOWBALL_FOREIGN20_RIGHTS_APPROVED: ${{ vars.SNOWBALL_FOREIGN20_RIGHTS_APPROVED }}
+          SNOWBALL_FOREIGN20_RIGHTS_MODE: ${{ vars.SNOWBALL_FOREIGN20_RIGHTS_MODE }}
+          SNOWBALL_FOREIGN20_RIGHTS_EVIDENCE_URL: ${{ vars.SNOWBALL_FOREIGN20_RIGHTS_EVIDENCE_URL }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_FOREIGN20_V262'
+          """Add *authorized* ECOS KOSPI+KOSDAQ foreign net buying to existing finance feed.
+          Do not change existing 2 daily finance sources. Never expose ECOS key or raw data to logs.
+          Rights are default DENY; an operator must review real licensing and explicitly opt in.
+          """
+          import datetime as dt
+          import json, math, os, re, urllib.parse, urllib.request
+          from pathlib import Path
+
+          SPECS = {
+              'kospi_d': ('0001000', '1980.01.04=100'),
+              'kosdaq_d': ('0089000', '1996.07.01=1000'),
+              'kospi_foreign_d': ('0030000', '억원'),
+              'kosdaq_foreign_d': ('0113000', '억원'),
+          }
+          TABLE='802Y001'
+          KST=dt.timezone(dt.timedelta(hours=9))
+          KEY_PATTERN=re.compile(r'[A-Za-z0-9_-]{8,128}')
+          EVIDENCE_PATTERN=re.compile(r'https://[^\s]{12,220}')
+          TODAY=dt.datetime.now(KST).date()
+
+          class Blocked(Exception): pass
+
+          def rights_ready(env):
+              """Attestation does not confer legal rights. Keep off without documented rights."""
+              return (env.get('SNOWBALL_FOREIGN20_RIGHTS_APPROVED') == 'CONFIRMED'
+                  and env.get('SNOWBALL_FOREIGN20_RIGHTS_MODE') in ('NONCOMMERCIAL_WITH_ATTRIBUTION','RIGHTSHOLDER_APPROVED')
+                  and bool(EVIDENCE_PATTERN.fullmatch(env.get('SNOWBALL_FOREIGN20_RIGHTS_EVIDENCE_URL',''))))
+
+          def parse_series(blob,sid):
+              block=blob.get('StatisticSearch') if isinstance(blob,dict) else None
+              if not isinstance(block,dict) or not isinstance(block.get('row'),list):raise Blocked('INVALID_RESPONSE')
+              try: count=int(block.get('list_total_count',-1))
+              except (TypeError,ValueError):raise Blocked('BAD_ROW_COUNT') from None
+              if count>900 or count<20:raise Blocked('BAD_ROW_COUNT')
+              item, unit = SPECS[sid]
+              rows={};dims=set()
+              for row in block['row']:
+                  if str(row.get('STAT_CODE',''))!=TABLE or str(row.get('ITEM_CODE1',''))!=item:continue
+                  if re.sub(r'\s+','',str(row.get('UNIT_NAME','')))!=unit:continue
+                  day=str(row.get('TIME',''))
+                  if not re.fullmatch(r'20\d{6}',day):continue
+                  try:dt.datetime.strptime(day,'%Y%m%d')
+                  except ValueError:continue
+                  dim=tuple(str(row.get('ITEM_CODE'+str(i),'') or '').strip() for i in (2,3,4))
+                  try: value=float(str(row.get('DATA_VALUE','')).replace(',','').strip())
+                  except (TypeError,ValueError):continue
+                  if not math.isfinite(value):continue
+                  if day in rows and rows[day]!=(value,dim):raise Blocked('DUPLICATE_DATE')
+                  rows[day]=(value,dim);dims.add(dim)
+              if len(dims)!=1 or len(rows)<20:raise Blocked('DIMENSIONS_OR_HISTORY')
+              return {day:pair[0] for day,pair in rows.items()}
+
+          def get_series(key,sid,today):
+              start=(today-dt.timedelta(days=90)).strftime('%Y%m%d')
+              items=['StatisticSearch',key,'json','kr','1','900',TABLE,'D',start,today.strftime('%Y%m%d'),SPECS[sid][0]]
+              url='https://ecos.bok.or.kr/api/'+'/'.join(urllib.parse.quote(x,safe='') for x in items)
+              try:
+                  req=urllib.request.Request(url,headers={'Accept':'application/json','User-Agent':'SNOWBALL-FINANCE-AUTHORIZED-FOREIGN20/1'})
+                  with urllib.request.urlopen(req,timeout=25) as response:
+                      if response.status!=200 or response.geturl()!=url:raise Blocked('HTTP')
+                      blob=response.read(1_500_001)
+                  if len(blob)>1_500_000:raise Blocked('RESPONSE_TOO_LARGE')
+                  return parse_series(json.loads(blob),sid)
+              except Exception:
+                  # ECOS key is embedded in URL. Never log exception, traceback, or request URL.
+                  raise Blocked('ECOS_FETCH_OR_SHAPE_FAILED') from None
+
+          def build_observation(data,today,evidence):
+              indices=sorted(set(data['kospi_d']) & set(data['kosdaq_d']))
+              if len(indices)<20:raise Blocked('INDEX_HISTORY_SHORT')
+              days=indices[-20:]
+              if (days[-1]!=max(data['kospi_d']) or days[-1]!=max(data['kosdaq_d']) or
+                  days[-1]!=max(data['kospi_foreign_d']) or days[-1]!=max(data['kosdaq_foreign_d'])):
+                  raise Blocked('LATEST_DAY_MISMATCH')
+              if any(day not in data['kospi_foreign_d'] or day not in data['kosdaq_foreign_d'] for day in days):
+                  raise Blocked('FLOW_TRADING_DATES_MISMATCH')
+              newest=dt.datetime.strptime(days[-1],'%Y%m%d').date()
+              if not 0<=(today-newest).days<=12:raise Blocked('STALE_OR_FUTURE')
+              if (newest-dt.datetime.strptime(days[0],'%Y%m%d').date()).days>36:
+                  raise Blocked('DATE_SPAN_TOO_LONG')
+              history=[[day,data['kospi_foreign_d'][day],data['kosdaq_foreign_d'][day]] for day in days]
+              if any(abs(row[1])>5_000_000 or abs(row[2])>5_000_000 for row in history):
+                  raise Blocked('VALUE_RANGE')
+              value=round(sum(row[1]+row[2] for row in history),3)
+              if not math.isfinite(value) or abs(value)>100_000_000:raise Blocked('TOTAL_RANGE')
+              return {'provider':'한국은행 ECOS','licenseReviewed':True,
+                 'publicRedistributionAuthorized':True,'licenseEvidence':evidence,
+                 'cycle':'D','definition':'KOSPI_KOSDAQ_FOREIGN_NETBUY_20D',
+                 'unit':'억원','table':TABLE,
+                 'codes':{'kospiIndex':'0001000','kosdaqIndex':'0089000',
+                          'kospiForeign':'0030000','kosdaqForeign':'0113000'},
+                 'latest':days[-1],'tradingDates':days,'history':history,'value':value}
+
+          def append_if_authorized(*,env=os.environ,fetch=get_series,today=TODAY):
+              if not rights_ready(env):return 'LOCKED_NO_RIGHTS'
+              key=env.get('ECOS_API_KEY','')
+              if not KEY_PATTERN.fullmatch(key):return 'LOCKED_NO_API_KEY'
+              file=Path('site/market/finance.json')
+              if not file.is_file():return 'BASE_FINANCE_MISSING'
+              try:
+                  current=json.loads(file.read_text('utf8'))
+                  if current.get('schema')!='SNOWBALL_FINANCE_VERIFIED_V1' or current.get('publisher')!='SNOWBALL-APPROVED-SOURCES':
+                      raise Blocked('BASE_SCHEMA_MISMATCH')
+                  sources=current.get('sources')
+                  if not isinstance(sources,dict) or not all(k in sources for k in ('customerDeposits','creditBalance')):
+                      raise Blocked('BASE_SOURCES_MISSING')
+                  finance_base={k:sources[k] for k in ('customerDeposits','creditBalance')}
+                  if not all(isinstance(s,dict) and s.get('cycle')=='D' for s in finance_base.values()):
+                      raise Blocked('BASE_SOURCE_INVALID')
+                  data={sid:fetch(key,sid,today) for sid in SPECS}
+                  foreign=build_observation(data,today,env['SNOWBALL_FOREIGN20_RIGHTS_EVIDENCE_URL'])
+                  # Other optional indicators remain unpopulated until verifiable licensed data exists.
+                  current['sources']={**finance_base,'foreign20d':foreign}
+                  blob=json.dumps(current,ensure_ascii=False,separators=(',',':'),allow_nan=False)+'\n'
+                  # Atomic replace only after all four upstream series and entitlement gates pass.
+                  temp=file.with_suffix('.tmp')
+                  temp.write_text(blob,encoding='utf8');temp.replace(file)
+                  return 'FOREIGN20_WRITTEN'
+              except Blocked as exc:
+                  return str(exc)
+              except Exception:
+                  return 'FOREIGN20_REJECTED'
+
+          def main():
+              result=append_if_authorized()
+              print('FINANCE_EXTENSION:',result,'(no source values or credentials logged)')
+              return 0  # Optional series failure never breaks existing verified two-source feed.
+
+          if __name__=='__main__':raise SystemExit(main())
+          PY_FOREIGN20_V262
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
       - name: Upload public feed artifact
