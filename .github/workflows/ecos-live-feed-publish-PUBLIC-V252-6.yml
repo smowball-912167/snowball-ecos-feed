@@ -398,6 +398,146 @@ jobs:
           
           if __name__=='__main__': sys.exit(main())
           PY_FINANCE_V256
+      - name: Add licensed ECOS foreign flow to existing finance feed (default off)
+        shell: bash
+        env:
+          ECOS_API_KEY: ${{ secrets.ECOS_API_KEY }}
+          SNOWBALL_FOREIGN20_RIGHTS_APPROVED: ${{ vars.SNOWBALL_FOREIGN20_RIGHTS_APPROVED }}
+          SNOWBALL_FOREIGN20_RIGHTS_MODE: ${{ vars.SNOWBALL_FOREIGN20_RIGHTS_MODE }}
+          SNOWBALL_FOREIGN20_RIGHTS_EVIDENCE_URL: ${{ vars.SNOWBALL_FOREIGN20_RIGHTS_EVIDENCE_URL }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_FOREIGN20_V262'
+          """Add *authorized* ECOS KOSPI+KOSDAQ foreign net buying to existing finance feed.
+          Do not change existing 2 daily finance sources. Never expose ECOS key or raw data to logs.
+          Rights are default DENY; an operator must review real licensing and explicitly opt in.
+          """
+          import datetime as dt
+          import json, math, os, re, urllib.parse, urllib.request
+          from pathlib import Path
+
+          SPECS = {
+              'kospi_d': ('0001000', '1980.01.04=100'),
+              'kosdaq_d': ('0089000', '1996.07.01=1000'),
+              'kospi_foreign_d': ('0030000', '억원'),
+              'kosdaq_foreign_d': ('0113000', '억원'),
+          }
+          TABLE='802Y001'
+          KST=dt.timezone(dt.timedelta(hours=9))
+          KEY_PATTERN=re.compile(r'[A-Za-z0-9_-]{8,128}')
+          EVIDENCE_PATTERN=re.compile(r'https://[^\s]{12,220}')
+          TODAY=dt.datetime.now(KST).date()
+
+          class Blocked(Exception): pass
+
+          def rights_ready(env):
+              """Attestation does not confer legal rights. Keep off without documented rights."""
+              return (env.get('SNOWBALL_FOREIGN20_RIGHTS_APPROVED') == 'CONFIRMED'
+                  and env.get('SNOWBALL_FOREIGN20_RIGHTS_MODE') in ('NONCOMMERCIAL_WITH_ATTRIBUTION','RIGHTSHOLDER_APPROVED')
+                  and bool(EVIDENCE_PATTERN.fullmatch(env.get('SNOWBALL_FOREIGN20_RIGHTS_EVIDENCE_URL',''))))
+
+          def parse_series(blob,sid):
+              block=blob.get('StatisticSearch') if isinstance(blob,dict) else None
+              if not isinstance(block,dict) or not isinstance(block.get('row'),list):raise Blocked('INVALID_RESPONSE')
+              try: count=int(block.get('list_total_count',-1))
+              except (TypeError,ValueError):raise Blocked('BAD_ROW_COUNT') from None
+              if count>900 or count<20:raise Blocked('BAD_ROW_COUNT')
+              item, unit = SPECS[sid]
+              rows={};dims=set()
+              for row in block['row']:
+                  if str(row.get('STAT_CODE',''))!=TABLE or str(row.get('ITEM_CODE1',''))!=item:continue
+                  if re.sub(r'\s+','',str(row.get('UNIT_NAME','')))!=unit:continue
+                  day=str(row.get('TIME',''))
+                  if not re.fullmatch(r'20\d{6}',day):continue
+                  try:dt.datetime.strptime(day,'%Y%m%d')
+                  except ValueError:continue
+                  dim=tuple(str(row.get('ITEM_CODE'+str(i),'') or '').strip() for i in (2,3,4))
+                  try: value=float(str(row.get('DATA_VALUE','')).replace(',','').strip())
+                  except (TypeError,ValueError):continue
+                  if not math.isfinite(value):continue
+                  if day in rows and rows[day]!=(value,dim):raise Blocked('DUPLICATE_DATE')
+                  rows[day]=(value,dim);dims.add(dim)
+              if len(dims)!=1 or len(rows)<20:raise Blocked('DIMENSIONS_OR_HISTORY')
+              return {day:pair[0] for day,pair in rows.items()}
+
+          def get_series(key,sid,today):
+              start=(today-dt.timedelta(days=90)).strftime('%Y%m%d')
+              items=['StatisticSearch',key,'json','kr','1','900',TABLE,'D',start,today.strftime('%Y%m%d'),SPECS[sid][0]]
+              url='https://ecos.bok.or.kr/api/'+'/'.join(urllib.parse.quote(x,safe='') for x in items)
+              try:
+                  req=urllib.request.Request(url,headers={'Accept':'application/json','User-Agent':'SNOWBALL-FINANCE-AUTHORIZED-FOREIGN20/1'})
+                  with urllib.request.urlopen(req,timeout=25) as response:
+                      if response.status!=200 or response.geturl()!=url:raise Blocked('HTTP')
+                      blob=response.read(1_500_001)
+                  if len(blob)>1_500_000:raise Blocked('RESPONSE_TOO_LARGE')
+                  return parse_series(json.loads(blob),sid)
+              except Exception:
+                  # ECOS key is embedded in URL. Never log exception, traceback, or request URL.
+                  raise Blocked('ECOS_FETCH_OR_SHAPE_FAILED') from None
+
+          def build_observation(data,today,evidence):
+              indices=sorted(set(data['kospi_d']) & set(data['kosdaq_d']))
+              if len(indices)<20:raise Blocked('INDEX_HISTORY_SHORT')
+              days=indices[-20:]
+              if (days[-1]!=max(data['kospi_d']) or days[-1]!=max(data['kosdaq_d']) or
+                  days[-1]!=max(data['kospi_foreign_d']) or days[-1]!=max(data['kosdaq_foreign_d'])):
+                  raise Blocked('LATEST_DAY_MISMATCH')
+              if any(day not in data['kospi_foreign_d'] or day not in data['kosdaq_foreign_d'] for day in days):
+                  raise Blocked('FLOW_TRADING_DATES_MISMATCH')
+              newest=dt.datetime.strptime(days[-1],'%Y%m%d').date()
+              if not 0<=(today-newest).days<=12:raise Blocked('STALE_OR_FUTURE')
+              if (newest-dt.datetime.strptime(days[0],'%Y%m%d').date()).days>36:
+                  raise Blocked('DATE_SPAN_TOO_LONG')
+              history=[[day,data['kospi_foreign_d'][day],data['kosdaq_foreign_d'][day]] for day in days]
+              if any(abs(row[1])>5_000_000 or abs(row[2])>5_000_000 for row in history):
+                  raise Blocked('VALUE_RANGE')
+              value=round(sum(row[1]+row[2] for row in history),3)
+              if not math.isfinite(value) or abs(value)>100_000_000:raise Blocked('TOTAL_RANGE')
+              return {'provider':'한국은행 ECOS','licenseReviewed':True,
+                 'publicRedistributionAuthorized':True,'licenseEvidence':evidence,
+                 'cycle':'D','definition':'KOSPI_KOSDAQ_FOREIGN_NETBUY_20D',
+                 'unit':'억원','table':TABLE,
+                 'codes':{'kospiIndex':'0001000','kosdaqIndex':'0089000',
+                          'kospiForeign':'0030000','kosdaqForeign':'0113000'},
+                 'latest':days[-1],'tradingDates':days,'history':history,'value':value}
+
+          def append_if_authorized(*,env=os.environ,fetch=get_series,today=TODAY):
+              if not rights_ready(env):return 'LOCKED_NO_RIGHTS'
+              key=env.get('ECOS_API_KEY','')
+              if not KEY_PATTERN.fullmatch(key):return 'LOCKED_NO_API_KEY'
+              file=Path('site/market/finance.json')
+              if not file.is_file():return 'BASE_FINANCE_MISSING'
+              try:
+                  current=json.loads(file.read_text('utf8'))
+                  if current.get('schema')!='SNOWBALL_FINANCE_VERIFIED_V1' or current.get('publisher')!='SNOWBALL-APPROVED-SOURCES':
+                      raise Blocked('BASE_SCHEMA_MISMATCH')
+                  sources=current.get('sources')
+                  if not isinstance(sources,dict) or not all(k in sources for k in ('customerDeposits','creditBalance')):
+                      raise Blocked('BASE_SOURCES_MISSING')
+                  finance_base={k:sources[k] for k in ('customerDeposits','creditBalance')}
+                  if not all(isinstance(s,dict) and s.get('cycle')=='D' for s in finance_base.values()):
+                      raise Blocked('BASE_SOURCE_INVALID')
+                  data={sid:fetch(key,sid,today) for sid in SPECS}
+                  foreign=build_observation(data,today,env['SNOWBALL_FOREIGN20_RIGHTS_EVIDENCE_URL'])
+                  # Other optional indicators remain unpopulated until verifiable licensed data exists.
+                  current['sources']={**finance_base,'foreign20d':foreign}
+                  blob=json.dumps(current,ensure_ascii=False,separators=(',',':'),allow_nan=False)+'\n'
+                  # Atomic replace only after all four upstream series and entitlement gates pass.
+                  temp=file.with_suffix('.tmp')
+                  temp.write_text(blob,encoding='utf8');temp.replace(file)
+                  return 'FOREIGN20_WRITTEN'
+              except Blocked as exc:
+                  return str(exc)
+              except Exception:
+                  return 'FOREIGN20_REJECTED'
+
+          def main():
+              result=append_if_authorized()
+              print('FINANCE_EXTENSION:',result,'(no source values or credentials logged)')
+              return 0  # Optional series failure never breaks existing verified two-source feed.
+
+          if __name__=='__main__':raise SystemExit(main())
+          PY_FOREIGN20_V262
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
       - name: Upload public feed artifact
